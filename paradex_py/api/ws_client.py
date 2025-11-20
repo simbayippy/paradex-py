@@ -167,6 +167,7 @@ class ParadexWebsocketClient:
         self.connector = connector
         self.auto_start_reader = auto_start_reader
         self._reader_task: asyncio.Task | None = None
+        self._reader_task_lock = asyncio.Lock()  # Lock to prevent concurrent reader task creation
 
         # Configurable sleep durations for simulator-friendly behavior
         self.reader_sleep_on_error = reader_sleep_on_error
@@ -179,19 +180,38 @@ class ParadexWebsocketClient:
         # Optional message validation
         self.validate_messages = validate_messages and TYPED_MODELS_AVAILABLE
 
-        if auto_start_reader:
-            try:
-                loop = asyncio.get_event_loop()
-                self._reader_task = loop.create_task(self._read_messages())
-            except RuntimeError:
-                # No event loop running, will start reader when connect() is called
-                pass
+        # Note: Reader task will be created in connect() when event loop is guaranteed to exist
+        # This prevents race conditions from trying to create tasks before event loop is ready
 
     async def __aexit__(self):
         await self._close_connection()
 
     def init_account(self, account: ParadexAccount) -> None:
         self.account = account
+
+    async def _ensure_reader_task(self) -> None:
+        """
+        Safely ensure a reader task is running.
+        Cancels and awaits old task before creating new one to prevent race conditions.
+        This method is thread-safe and prevents multiple reader tasks from running simultaneously.
+        """
+        async with self._reader_task_lock:
+            # Cancel and await old task if it exists and is still running
+            if self._reader_task is not None:
+                if not self._reader_task.done():
+                    self._reader_task.cancel()
+                    try:
+                        # Wait for task to be fully cancelled (with timeout to prevent hanging)
+                        await asyncio.wait_for(self._reader_task, timeout=2.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        # Task was cancelled or timed out - either way it's stopped
+                        pass
+                self._reader_task = None
+
+            # Create new task only if auto_start_reader is enabled
+            if self.auto_start_reader:
+                self._reader_task = asyncio.create_task(self._read_messages())
+                self.logger.debug(f"{self.classname}: Reader task created")
 
     async def connect(self) -> bool:
         """Connect to Paradex WebSocket API.
@@ -229,9 +249,9 @@ class ParadexWebsocketClient:
 
             self.logger.info(f"{self.classname}: Connected to {self.api_url}")
 
-            # Start reader task if auto_start_reader is enabled and not already running
-            if self.auto_start_reader and self._reader_task is None:
-                self._reader_task = asyncio.create_task(self._read_messages())
+            # Start reader task safely (will cancel old task if exists and create new one)
+            if self.auto_start_reader:
+                await self._ensure_reader_task()
 
             if self.account:
                 await self._send_auth_id(self.ws, self.account.jwt_token)
@@ -255,12 +275,18 @@ class ParadexWebsocketClient:
 
     async def _close_connection(self):
         try:
-            # Cancel reader task if it exists
-            if self._reader_task and not self._reader_task.done():
-                self._reader_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._reader_task
-                self._reader_task = None
+            # Cancel reader task safely using lock to prevent race conditions
+            async with self._reader_task_lock:
+                if self._reader_task is not None:
+                    if not self._reader_task.done():
+                        self._reader_task.cancel()
+                        try:
+                            # Wait for task to be fully cancelled (with timeout to prevent hanging)
+                            await asyncio.wait_for(self._reader_task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            # Task was cancelled or timed out - either way it's stopped
+                            pass
+                    self._reader_task = None
 
             if self.ws:
                 self.logger.info(f"{self.classname}: Closing connection...")
@@ -331,7 +357,28 @@ class ParadexWebsocketClient:
             return state_val == "OPEN" or (state_val is None and hasattr(self.ws, "recv"))
 
     async def _read_messages(self) -> None:
+        """
+        Read messages from websocket connection.
+        
+        This method runs in a background task and continuously reads messages.
+        Safety check ensures only the active reader task processes messages.
+        """
+        # Safety check: ensure we're the active reader task
+        # This prevents duplicate tasks from processing messages simultaneously
+        current_task = asyncio.current_task()
+        if self._reader_task is not None and self._reader_task != current_task:
+            self.logger.warning(
+                f"{self.classname}: Duplicate reader task detected (current task: {current_task}, "
+                f"active task: {self._reader_task}), exiting to prevent concurrency issues"
+            )
+            return
+
         while True:
+            # Check if we're still the active reader task
+            if self._reader_task != current_task:
+                self.logger.debug(f"{self.classname}: Reader task replaced, exiting")
+                return
+
             if self._is_connection_open() and self.ws is not None:
                 try:
                     response = await asyncio.wait_for(self.ws.recv(), timeout=self.ws_timeout)
@@ -346,6 +393,10 @@ class ParadexWebsocketClient:
                     await self._reconnect()
                 except asyncio.TimeoutError:
                     pass
+                except asyncio.CancelledError:
+                    # Task was cancelled, exit gracefully
+                    self.logger.debug(f"{self.classname}: Reader task cancelled")
+                    raise
                 except Exception:
                     self.logger.exception(f"{self.classname}: Connection failed traceback:{traceback.format_exc()}")
                     if self.reader_sleep_on_error > 0:
